@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""
-nputop v0.2.0 — NPU + System Monitor for Qualcomm IQ8 (QCS8300 / Hexagon V75 HTP)
-
-Usage:
-  python3 nputop.py                          # system dashboard only
-  python3 nputop.py --wrap "cmd args"        # wrap inference runner
-  python3 nputop.py --qnn-log /tmp/qnn.pipe  # tail a log/pipe
-  python3 nputop.py --refresh 0.5            # faster refresh
-"""
+"""nputop v0.2.1 — NPU + System Monitor for Qualcomm IQ8 (QCS8300 / Hexagon V75 HTP)"""
 
 import argparse
 import curses
@@ -18,7 +10,7 @@ import threading
 import time
 from collections import deque
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from collectors.cpu     import CPUCollector
 from collectors.memory  import MemoryCollector
@@ -27,13 +19,11 @@ from collectors.ddr     import DDRCollector
 from collectors.qnn     import QNNProfileCollector
 from collectors.npu     import NPUCollector
 from ui.panels import (
-    init_colors,
-    draw_title, draw_npu_hw, draw_qnn,
-    draw_memory, draw_ddr, draw_cpu,
-    draw_thermal, draw_help,
+    init_colors, draw_title, draw_npu_hw, draw_qnn,
+    draw_memory, draw_ddr, draw_cpu, draw_thermal, draw_help,
 )
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 class SubprocessFeeder:
@@ -80,45 +70,21 @@ class SubprocessFeeder:
             self._proc.terminate()
 
 
-def _draw(stdscr, collectors, feeder, paused, show_raw):
+def _draw(stdscr, collectors, feeder, show_raw):
     cpu_c, mem_c, therm_c, ddr_c, qnn_c, npu_c = collectors
     stdscr.erase()
     h, w = stdscr.getmaxyx()
     row  = 0
 
     row += draw_title(stdscr, row, 0, w, VERSION)
+    if row < h - 2: row += draw_npu_hw (stdscr, row, 0, w, npu_c.collect())
+    if row < h - 2: row += draw_qnn    (stdscr, row, 0, w, qnn_c.collect())
+    if row < h - 2: row += draw_memory (stdscr, row, 0, w, mem_c.collect())
+    if row < h - 2: row += draw_ddr    (stdscr, row, 0, w, ddr_c.collect())
+    if row < h - 2: row += draw_cpu    (stdscr, row, 0, w, cpu_c.collect())
+    if row < h - 2: row += draw_thermal(stdscr, row, 0, w, therm_c.collect())
 
-    npu_data   = npu_c.collect()
-    cpu_data   = cpu_c.collect()
-    mem_data   = mem_c.collect()
-    therm_data = therm_c.collect()
-    ddr_data   = ddr_c.collect()
-    qnn_data   = qnn_c.collect()
-
-    # NPU hardware signals always shown first
-    if row < h - 2:
-        row += draw_npu_hw(stdscr, row, 0, w, npu_data)
-
-    # QNN inference metrics (only if we have a log source or any data)
-    if row < h - 2:
-        row += draw_qnn(stdscr, row, 0, w, qnn_data)
-
-    if row < h - 2:
-        row += draw_memory(stdscr, row, 0, w, mem_data)
-    if row < h - 2:
-        row += draw_ddr(stdscr, row, 0, w, ddr_data)
-    if row < h - 2:
-        row += draw_cpu(stdscr, row, 0, w, cpu_data)
-    if row < h - 2:
-        row += draw_thermal(stdscr, row, 0, w, therm_data)
-
-    if feeder and show_raw and row < h - 2:
-        try:
-            stdscr.addstr(row, 0, "── raw output ─────────────────",
-                          curses.color_pair(2) | curses.A_BOLD)
-            row += 1
-        except curses.error:
-            pass
+    if feeder and show_raw:
         for line in feeder.recent_output():
             if row >= h - 2:
                 break
@@ -135,7 +101,6 @@ def _draw(stdscr, collectors, feeder, paused, show_raw):
 def _main(stdscr, args):
     curses.curs_set(0)
     stdscr.nodelay(True)
-    stdscr.timeout(int(args.refresh * 1000))
     init_colors()
 
     cpu_c   = CPUCollector()
@@ -144,30 +109,32 @@ def _main(stdscr, args):
     ddr_c   = DDRCollector()
     qnn_c   = QNNProfileCollector(log_path=args.qnn_log)
     npu_c   = NPUCollector()
-
     collectors = (cpu_c, mem_c, therm_c, ddr_c, qnn_c, npu_c)
 
-    feeder = None
+    feeder   = None
     if args.wrap:
         feeder = SubprocessFeeder(args.wrap, qnn_c)
         feeder.start()
 
-    paused   = False
-    show_raw = False
+    show_raw  = False
+    last_draw = 0.0
 
     while True:
-        try:
-            _draw(stdscr, collectors, feeder, paused, show_raw)
-        except curses.error:
-            pass
+        now = time.monotonic()
+        if now - last_draw >= args.refresh:
+            try:
+                _draw(stdscr, collectors, feeder, show_raw)
+            except curses.error:
+                pass
+            last_draw = now
 
+        sleep_for = max(0.05, args.refresh - (time.monotonic() - last_draw))
+        stdscr.timeout(int(sleep_for * 1000))
         key = stdscr.getch()
+
         if key in (ord('q'), ord('Q')):
-            if feeder:
-                feeder.terminate()
+            if feeder: feeder.terminate()
             break
-        elif key in (ord('p'), ord('P')):
-            paused = not paused
         elif key in (ord('r'), ord('R')):
             show_raw = not show_raw
         elif key in (ord('c'), ord('C')):
@@ -185,14 +152,11 @@ def _main(stdscr, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="nputop v0.2.0 — NPU + System Monitor for Qualcomm IQ8 (QCS8300)"
+        description="nputop — NPU + System Monitor for Qualcomm IQ8 (QCS8300)"
     )
-    parser.add_argument("--qnn-log", metavar="PATH",
-                        help="Tail a QNN profiling log or named pipe")
-    parser.add_argument("--wrap", metavar="CMD",
-                        help="Run CMD and capture its output for QNN parsing")
-    parser.add_argument("--refresh", type=float, default=1.0, metavar="SEC",
-                        help="Refresh interval in seconds (default: 1.0)")
+    parser.add_argument("--qnn-log", metavar="PATH")
+    parser.add_argument("--wrap",    metavar="CMD")
+    parser.add_argument("--refresh", type=float, default=1.0, metavar="SEC")
     args = parser.parse_args()
 
     if args.qnn_log and args.wrap:
